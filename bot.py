@@ -1,5 +1,6 @@
 import logging
-from telegram import Update
+import tempfile
+from telegram import Update, Bot
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -7,6 +8,7 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+from telegram.error import TelegramError
 
 # === Logger ===
 logging.basicConfig(
@@ -14,22 +16,22 @@ logging.basicConfig(
     level=logging.INFO
 )
 
-# === Bot Token ===
 BOT_TOKEN = "7808185967:AAHOpUEoxP3kM_Rg7BtrMWdD0icpdkt8U9M"
+bot = Bot(token=BOT_TOKEN)
 
-# === Storage for file statistics ===
+# === In-Memory Storage ===
 file_stats = {}  # {chat_id: {"name": str, "count": int, "size": int}}
+file_index = {}  # {file_id: {"chat_id": int, "size": int, "filename": str}}
 
 # === Start Command ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Hello! I'm your File Tracker Bot 📊")
+    await update.message.reply_text("Hi there, I am Dev 2.0, managing Dev's media collection since 2018!")
 
 # === Handle File Messages ===
 async def handle_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         message = update.message or update.channel_post
         if not message:
-            logging.info("No message received")
             return
 
         file_obj = None
@@ -49,10 +51,11 @@ async def handle_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
             file_type = "Image"
 
         if not file_obj:
-            logging.info(f"🟡 Not a file: {message.text or 'non-text content'}")
             return
 
         file_size = file_obj.file_size or 0
+        file_id = file_obj.file_id
+        filename = getattr(file_obj, 'file_name', f"{file_type}_{file_id}")
         chat_id = message.chat.id
         chat_title = message.chat.title or message.chat.username or "Private Chat"
 
@@ -62,10 +65,98 @@ async def handle_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_stats[chat_id]["count"] += 1
         file_stats[chat_id]["size"] += file_size
 
+        file_index[file_id] = {"chat_id": chat_id, "size": file_size, "filename": filename}
+
         logging.info(f"✅ Processed {file_type} in {chat_title}: {file_size} bytes")
 
     except Exception as e:
         logging.error(f"❌ Error processing file: {e}")
+
+# === Delete by file ID ===
+async def report_deletion(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if not context.args:
+            await update.message.reply_text("Please provide a file ID to report deletion.")
+            return
+
+        file_id = context.args[0]
+
+        if file_id not in file_index:
+            await update.message.reply_text(f"⚠️ File ID {file_id} not found.", parse_mode="Markdown")
+            return
+
+        record = file_index.pop(file_id)
+        chat_id = record["chat_id"]
+        size = record["size"]
+
+        if chat_id in file_stats:
+            file_stats[chat_id]["count"] = max(0, file_stats[chat_id]["count"] - 1)
+            file_stats[chat_id]["size"] = max(0, file_stats[chat_id]["size"] - size)
+
+        await update.message.reply_text(f"🗑️ File ID {file_id} deleted and stats updated.", parse_mode="Markdown")
+
+    except Exception as e:
+        logging.error(f"❌ Error reporting deletion: {e}")
+        await update.message.reply_text(f"Error: {e}")
+
+# === Delete by file name ===
+async def delete_by_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if not context.args:
+            await update.message.reply_text("Please provide the filename to delete.")
+            return
+
+        filename = " ".join(context.args)
+        deleted = False
+
+        for file_id, info in list(file_index.items()):
+            if info.get("filename") == filename:
+                chat_id = info["chat_id"]
+                size = info["size"]
+
+                file_stats[chat_id]["count"] = max(0, file_stats[chat_id]["count"] - 1)
+                file_stats[chat_id]["size"] = max(0, file_stats[chat_id]["size"] - size)
+
+                del file_index[file_id]
+                deleted = True
+
+                await update.message.reply_text(f"🗑️ File '{filename}' deleted and stats updated.")
+                break
+
+        if not deleted:
+            await update.message.reply_text(f"⚠️ File named '{filename}' not found.")
+
+    except Exception as e:
+        logging.error(f"❌ Error deleting by name: {e}")
+        await update.message.reply_text(f"Error: {e}")
+
+# === Refresh Command (checks if file can be downloaded) ===
+async def refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        deleted_files = 0
+
+        for file_id in list(file_index.keys()):
+            try:
+                file = await bot.get_file(file_id)
+                # Try downloading to memory to detect real deletion
+                await file.download_to_memory()
+
+            except TelegramError:
+                record = file_index.pop(file_id)
+                chat_id = record["chat_id"]
+                size = record["size"]
+
+                if chat_id in file_stats:
+                    file_stats[chat_id]["count"] = max(0, file_stats[chat_id]["count"] - 1)
+                    file_stats[chat_id]["size"] = max(0, file_stats[chat_id]["size"] - size)
+
+                deleted_files += 1
+
+        await update.message.reply_text(f"🔄 Refresh complete. Removed {deleted_files} deleted file(s).")
+
+    except Exception as e:
+        logging.error(f"❌ Error during refresh: {e}")
+        await update.message.reply_text(f"Error during refresh: {e}")
 
 # === Stats Command ===
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -73,20 +164,21 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No file data recorded yet.")
         return
 
-    msg = "📊 *File Stats Summary:*\n\n"
-    for chat_id, stat in file_stats.items():
-        size_mb = stat["size"] / (1024 * 1024)
-        msg += f"📁 *{stat['name']}*\n"
-        msg += f"  • Files: {stat['count']}\n"
-        size_mb = float(size_mb)  # ensure it's a float
-        gb = int(size_mb // 1000)
-        mb = int(size_mb % 1000)
-        kb = int((size_mb - int(size_mb)) * 1000)
+    total_files = sum(stat["count"] for stat in file_stats.values())
+    total_size = sum(stat["size"] for stat in file_stats.values())
 
-        msg += f"  • Total Size: {gb} GB\n"
-        msg += f"  • Total Size: {mb} MB\n"
-        msg += f"  • Total Size: {kb} KB\n\n"
+    size_mb = total_size / (1024 * 1024)
+    gb = int(size_mb // 1000)
+    mb = int(size_mb % 1000)
+    kb = int((size_mb - int(size_mb)) * 1000)
 
+    msg = (
+        "📊 *Global File Stats Summary:*\n\n"
+        f"  • Total Files: {total_files}\n"
+        f"  • Total Size: {gb} GB\n"
+        f"  • Total Size: {mb} MB\n"
+        f"  • Total Size: {kb} KB\n"
+    )
 
     await update.message.reply_text(msg, parse_mode="Markdown")
 
@@ -96,16 +188,16 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stats", stats))
+    app.add_handler(CommandHandler("report_deletion", report_deletion))
+    app.add_handler(CommandHandler("delete_by_name", delete_by_name))
+    app.add_handler(CommandHandler("refresh", refresh))  # ✅ Updated
 
-    # ✅ Correct filters for PTB v20+
     media_filters = (
-    filters.Document.ALL |
-    filters.PHOTO |
-    filters.VIDEO |
-    filters.AUDIO
-)
-
-
+        filters.Document.ALL |
+        filters.PHOTO |
+        filters.VIDEO |
+        filters.AUDIO
+    )
     app.add_handler(MessageHandler(media_filters, handle_files))
 
     print("🤖 Bot is running...")
